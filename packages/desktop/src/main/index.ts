@@ -135,9 +135,9 @@ const main = Effect.gen(function* () {
   initCrashReporter()
 
   try {
-    setDefaultCACertificates([...new Set([...getCACertificates("default"), ...getCACertificates("system")])])
+    setDefaultCACertificates(getCACertificates("default"))
   } catch (error) {
-    logger.warn("failed to load system certificates", error)
+    logger.warn("failed to load default certificates", error)
   }
 
   logger.log("app starting", {

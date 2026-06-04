@@ -1,14 +1,6 @@
-import * as http from "node:http"
-import * as tls from "node:tls"
-
-type NodeHttpWithEnvProxy = typeof http & {
-  setGlobalProxyFromEnv: () => void
-}
-
-type NodeTlsWithSystemCertificates = typeof tls & {
-  getCACertificates: (type: "default" | "system") => string[]
-  setDefaultCACertificates: (certificates: string[]) => void
-}
+import { spawn, ChildProcess } from "node:child_process"
+import * as path from "node:path"
+import * as fs from "node:fs"
 
 type StartCommand = {
   type: "start"
@@ -31,12 +23,16 @@ type ParentPort = {
   on(event: "message", listener: (event: { data: unknown }) => void): void
 }
 
-type Listener = {
-  stop(close?: boolean): void | Promise<void>
+function getParentPort(): ParentPort {
+  const port =
+    (process as unknown as { parentPort?: ParentPort }).parentPort ??
+    (globalThis as unknown as { parentPort?: ParentPort }).parentPort
+  if (!port) throw new Error("Sidecar parent port unavailable")
+  return port
 }
 
 const parentPort = getParentPort()
-let listener: Listener | undefined
+let childProcess: ChildProcess | undefined
 
 parentPort.on("message", (event) => {
   const command = parseCommand(event.data)
@@ -50,20 +46,51 @@ parentPort.on("message", (event) => {
 
 async function start(command: StartCommand) {
   try {
-    prepareSidecarEnv(command.password, command.userDataPath)
-    ensureLoopbackNoProxy()
-    useSystemCertificates()
-    useEnvProxy()
-    const { Log, Server } = await import("virtual:opencode-server")
-    await Log.init({ level: "WARN" })
+    const cliBinary = findCodefreeBinary()
+    if (!cliBinary) {
+      throw new Error("codefree-o CLI not found. Please install it globally: npm install -g @srdcloud/codefree-o")
+    }
 
-    listener = await Server.listen({
-      port: command.port,
-      hostname: command.hostname,
-      username: "opencode",
-      password: command.password,
-      cors: ["oc://renderer"],
+    const noProxy = buildNoProxyValue()
+
+    childProcess = spawn(
+      cliBinary,
+      ["serve", "--hostname", command.hostname, "--port", String(command.port), "--cors", "oc://renderer"],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          OPENCODE_SERVER_PASSWORD: command.password,
+          OPENCODE_SERVER_USERNAME: "opencode",
+          XDG_STATE_HOME: process.env.XDG_STATE_HOME ?? command.userDataPath,
+          NO_PROXY: noProxy,
+          no_proxy: noProxy.toLowerCase(),
+        },
+      },
+    )
+
+    childProcess.stdout?.on("data", (data: Buffer) => {
+      console.log("[codefree-o stdout]", data.toString("utf8").trim())
     })
+
+    childProcess.stderr?.on("data", (data: Buffer) => {
+      console.error("[codefree-o stderr]", data.toString("utf8").trim())
+    })
+
+    childProcess.on("error", (error) => {
+      parentPort.postMessage({ type: "error", error: serializeError(error) })
+    })
+
+    childProcess.on("exit", (code, signal) => {
+      if (code !== 0 && code !== null) {
+        parentPort.postMessage({
+          type: "error",
+          error: { message: `codefree-o exited with code ${code}` },
+        })
+      }
+    })
+
+    await waitForServerReady(command.hostname, command.port, command.password)
     parentPort.postMessage({ type: "ready" })
   } catch (error) {
     parentPort.postMessage({ type: "error", error: serializeError(error) })
@@ -73,59 +100,90 @@ async function start(command: StartCommand) {
 
 async function stop() {
   try {
-    await listener?.stop()
+    if (childProcess) {
+      childProcess.kill("SIGTERM")
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          childProcess?.kill("SIGKILL")
+          resolve()
+        }, 5000)
+        childProcess?.on("exit", () => {
+          clearTimeout(timer)
+          resolve()
+        })
+      })
+      childProcess = undefined
+    }
   } finally {
-    listener = undefined
     parentPort.postMessage({ type: "stopped" })
     setImmediate(() => process.exit(0))
   }
 }
 
-function prepareSidecarEnv(password: string, userDataPath: string) {
-  Object.assign(process.env, {
-    OPENCODE_SERVER_USERNAME: "opencode",
-    OPENCODE_SERVER_PASSWORD: password,
-    XDG_STATE_HOME: process.env.XDG_STATE_HOME ?? userDataPath,
-  })
+function findCodefreeBinary(): string | null {
+  const binName = process.platform === "win32" ? "codefree-o.exe" : "codefree-o"
+
+  if (process.env.OPENCODE_BIN_PATH) {
+    return process.env.OPENCODE_BIN_PATH
+  }
+
+  const pathEnv = process.env.PATH || ""
+  const pathSep = process.platform === "win32" ? ";" : ":"
+
+  for (const dir of pathEnv.split(pathSep)) {
+    const candidate = path.join(dir, binName)
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK)
+      return candidate
+    } catch {}
+  }
+
+  return null
 }
 
-function ensureLoopbackNoProxy() {
+async function waitForServerReady(hostname: string, port: number, password: string): Promise<void> {
+  const maxAttempts = 60
+  const delayMs = 500
+  const fetchTimeoutMs = 2000
+  const totalTimeoutMs = maxAttempts * (fetchTimeoutMs + delayMs)
+
+  const headers = new Headers()
+  const auth = Buffer.from(`opencode:${password}`).toString("base64")
+  headers.set("authorization", `Basic ${auth}`)
+
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const url = `http://${hostname}:${port}/global/health`
+      const response = await fetch(url, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(fetchTimeoutMs),
+      })
+      if (response.ok) {
+        return
+      }
+    } catch {}
+
+    await new Promise((resolve) => setTimeout(resolve, delayMs))
+  }
+
+  throw new Error(`Server did not become ready within ${totalTimeoutMs}ms`)
+}
+
+function buildNoProxyValue(): string {
   const loopback = ["127.0.0.1", "localhost", "::1"]
   const upsert = (key: string) => {
     const items = (process.env[key] ?? "")
       .split(",")
-      .map((value: string) => value.trim())
-      .filter((value: string) => Boolean(value))
-
+      .map((v) => v.trim())
+      .filter(Boolean)
     for (const host of loopback) {
-      if (items.some((value: string) => value.toLowerCase() === host)) continue
+      if (items.some((v) => v.toLowerCase() === host)) continue
       items.push(host)
     }
-
-    process.env[key] = items.join(",")
+    return items.join(",")
   }
-
-  upsert("NO_PROXY")
-  upsert("no_proxy")
-}
-
-function useSystemCertificates() {
-  try {
-    const nodeTls = tls as NodeTlsWithSystemCertificates
-    nodeTls.setDefaultCACertificates([
-      ...new Set([...nodeTls.getCACertificates("default"), ...nodeTls.getCACertificates("system")]),
-    ])
-  } catch (error) {
-    console.warn("failed to load system certificates", error)
-  }
-}
-
-function useEnvProxy() {
-  try {
-    ;(http as NodeHttpWithEnvProxy).setGlobalProxyFromEnv()
-  } catch (error) {
-    console.warn("failed to load proxy environment", error)
-  }
+  return upsert("NO_PROXY")
 }
 
 function parseCommand(value: unknown): SidecarCommand | undefined {
@@ -149,10 +207,4 @@ function parseCommand(value: unknown): SidecarCommand | undefined {
 function serializeError(error: unknown) {
   if (error instanceof Error) return { message: error.message, stack: error.stack }
   return { message: String(error) }
-}
-
-function getParentPort() {
-  const port = process.parentPort as ParentPort | undefined
-  if (!port) throw new Error("Sidecar parent port unavailable")
-  return port
 }
