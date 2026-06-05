@@ -52,12 +52,14 @@ async function start(command: StartCommand) {
     }
 
     const noProxy = buildNoProxyValue()
+    const isCmd = cliBinary.endsWith(".cmd") || cliBinary.endsWith(".ps1")
 
     childProcess = spawn(
-      cliBinary,
+      isCmd ? `"${cliBinary}"` : cliBinary,
       ["serve", "--hostname", command.hostname, "--port", String(command.port), "--cors", "oc://renderer"],
       {
         stdio: ["ignore", "pipe", "pipe"],
+        shell: isCmd,
         env: {
           ...process.env,
           OPENCODE_SERVER_PASSWORD: command.password,
@@ -121,21 +123,24 @@ async function stop() {
 }
 
 function findCodefreeBinary(): string | null {
-  const binName = process.platform === "win32" ? "codefree-o.exe" : "codefree-o"
-
   if (process.env.OPENCODE_BIN_PATH) {
     return process.env.OPENCODE_BIN_PATH
   }
+
+  const binNames =
+    process.platform === "win32" ? ["codefree-o.cmd", "codefree-o.exe", "codefree-o.ps1"] : ["codefree-o"]
 
   const pathEnv = process.env.PATH || ""
   const pathSep = process.platform === "win32" ? ";" : ":"
 
   for (const dir of pathEnv.split(pathSep)) {
-    const candidate = path.join(dir, binName)
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK)
-      return candidate
-    } catch {}
+    for (const name of binNames) {
+      const candidate = path.join(dir, name)
+      try {
+        fs.accessSync(candidate, fs.constants.F_OK)
+        return candidate
+      } catch {}
+    }
   }
 
   return null

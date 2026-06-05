@@ -62,14 +62,8 @@ const getBase = (): Configuration => ({
     signtoolOptions: {
       sign: signWindows,
     },
-    target: ["nsis"],
+    target: ["portable"],
     verifyUpdateCodeSignature: false,
-  },
-  nsis: {
-    oneClick: true,
-    perMachine: false,
-    installerIcon: `resources/icons/icon.ico`,
-    installerHeaderIcon: `resources/icons/icon.ico`,
   },
   linux: {
     icon: `resources/icons`,

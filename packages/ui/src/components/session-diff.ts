@@ -26,14 +26,16 @@ export type ViewDiff = {
 
 const diffCacheLimit = 16
 const patchFileDiffCache = new Map<string, FileDiffMetadata>()
+const MAX_DIFF_SIZE = 100 * 1024
 
 export function resolveFileDiff(diff: DiffSource) {
   if (typeof diff.patch === "string") return fileDiffFromPatch(diff.file, diff.patch)
-  return fileDiffFromContent(
-    diff.file,
-    typeof diff.before === "string" ? diff.before : "",
-    typeof diff.after === "string" ? diff.after : "",
-  )
+  const before = typeof diff.before === "string" ? diff.before : ""
+  const after = typeof diff.after === "string" ? diff.after : ""
+  if (before.length > MAX_DIFF_SIZE || after.length > MAX_DIFF_SIZE) {
+    return fileDiffFromLargeFile(diff.file, before, after)
+  }
+  return fileDiffFromContent(diff.file, before, after)
 }
 
 export function normalize(diff: ReviewDiff): ViewDiff {
@@ -63,7 +65,7 @@ function fileDiffFromPatch(file: string, patch: string) {
   const contents = completePatchContents(patch)
   const input = contents ? undefined : patchInput(file, patch)
   const value = contents
-    ? fileDiffFromContent(file, contents.before, contents.after)
+    ? fileDiffFromLargeAware(file, contents.before, contents.after)
     : ((input ? parsePatchFiles(input)[0]?.files[0] : undefined) ?? emptyFileDiff(file))
   patchFileDiffCache.set(key, value)
   while (patchFileDiffCache.size > diffCacheLimit) patchFileDiffCache.delete(patchFileDiffCache.keys().next().value!)
@@ -139,6 +141,26 @@ function fileDiffFromContent(file: string, before: string, after: string) {
   return parseDiffFromFile({ name: file, contents: before }, { name: file, contents: after })
 }
 
+function fileDiffFromLargeAware(file: string, before: string, after: string) {
+  if (before.length > MAX_DIFF_SIZE || after.length > MAX_DIFF_SIZE) {
+    return fileDiffFromLargeFile(file, before, after)
+  }
+  return fileDiffFromContent(file, before, after)
+}
+
 function emptyFileDiff(file: string) {
   return parseDiffFromFile({ name: file, contents: "" }, { name: file, contents: "" })
+}
+
+function fileDiffFromLargeFile(file: string, before: string, after: string) {
+  const beforeTruncated = before.slice(0, MAX_DIFF_SIZE)
+  const afterTruncated = after.slice(0, MAX_DIFF_SIZE)
+  const beforeOmitted = before.length - MAX_DIFF_SIZE
+  const afterOmitted = after.length - MAX_DIFF_SIZE
+  const beforeSuffix = beforeOmitted > 0 ? `\n... (${beforeOmitted} more bytes)` : ""
+  const afterSuffix = afterOmitted > 0 ? `\n... (${afterOmitted} more bytes)` : ""
+  return parseDiffFromFile(
+    { name: file, contents: beforeTruncated + beforeSuffix },
+    { name: file, contents: afterTruncated + afterSuffix },
+  )
 }
