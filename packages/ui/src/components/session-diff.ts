@@ -24,6 +24,16 @@ export type ViewDiff = {
   fileDiff: FileDiffMetadata
 }
 
+export type ViewDiffMeta = {
+  file: string
+  additions: number
+  deletions: number
+  status?: "added" | "deleted" | "modified"
+  patch?: string
+  before?: string
+  after?: string
+}
+
 const diffCacheLimit = 16
 const patchFileDiffCache = new Map<string, FileDiffMetadata>()
 const MAX_DIFF_SIZE = 100 * 1024
@@ -45,6 +55,18 @@ export function normalize(diff: ReviewDiff): ViewDiff {
     deletions: diff.deletions,
     status: diff.status,
     fileDiff: resolveFileDiff(diff),
+  }
+}
+
+export function normalizeMeta(diff: ReviewDiff): ViewDiffMeta {
+  return {
+    file: diff.file,
+    additions: diff.additions,
+    deletions: diff.deletions,
+    status: diff.status,
+    patch: diff.patch,
+    before: "before" in diff ? (diff as LegacyDiff).before : undefined,
+    after: "after" in diff ? (diff as LegacyDiff).after : undefined,
   }
 }
 
